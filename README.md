@@ -1,5 +1,13 @@
 ## SSD: Single-Shot MultiBox Detector implementation in Keras
 ---
+
+This is a fork of https://github.com/pierluigiferrari/ssd_keras with minimal changes:
+
+- move python files inside a package to make it pip-installable / importable
+- some minor bug fixes + make BatchGenerator more general (see history)
+
+---
+
 ### Contents
 
 1. [Overview](#overview)
