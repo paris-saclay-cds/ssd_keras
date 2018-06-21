@@ -23,6 +23,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import numpy as np
 
+try:
+    import numba
+    NUMBA_INSTALLED = True
+except ImportError:
+    NUMBA_INSTALLED = False
+
+
 def iou(boxes1, boxes2, coords='centroids'):
     '''
     Compute the intersection-over-union similarity (also known as Jaccard similarity)
@@ -46,7 +53,6 @@ def iou(boxes1, boxes2, coords='centroids'):
         A 1D Numpy array of dtype float containing values in [0,1], the Jaccard similarity of the boxes in `boxes1` and `boxes2`.
         0 means there is no overlap between two given boxes, 1 means their coordinates are identical.
     '''
-
     if len(boxes1.shape) > 2: raise ValueError("boxes1 must have rank either 1 or 2, but has rank {}.".format(len(boxes1.shape)))
     if len(boxes2.shape) > 2: raise ValueError("boxes2 must have rank either 1 or 2, but has rank {}.".format(len(boxes2.shape)))
 
@@ -66,6 +72,21 @@ def iou(boxes1, boxes2, coords='centroids'):
     union = (boxes1[:,1] - boxes1[:,0]) * (boxes1[:,3] - boxes1[:,2]) + (boxes2[:,1] - boxes2[:,0]) * (boxes2[:,3] - boxes2[:,2]) - intersection
 
     return intersection / union
+
+
+if NUMBA_INSTALLED:
+    @numba.jit(nopython=True)
+    def iou_specialized(boxes1, boxes2):
+        boxes2b = np.expand_dims(boxes2, axis=0)
+
+        intersection = np.maximum(0, np.minimum(boxes1[:,1], boxes2b[:,1]) - np.maximum(boxes1[:,0], boxes2b[:,0])) * np.maximum(0, np.minimum(boxes1[:,3], boxes2b[:,3]) - np.maximum(boxes1[:,2], boxes2b[:,2]))
+        union = (boxes1[:,1] - boxes1[:,0]) * (boxes1[:,3] - boxes1[:,2]) + (boxes2b[:,1] - boxes2b[:,0]) * (boxes2b[:,3] - boxes2b[:,2]) - intersection
+
+        return intersection / union
+else:
+    def iou_specialized(boxes1, boxes2):
+        return iou(boxes1, boxes2, coords='minmax')
+
 
 def convert_coordinates(tensor, start_index, conversion='minmax2centroids'):
     '''
@@ -190,22 +211,58 @@ def greedy_nms(y_pred_decoded, iou_threshold=0.45, coords='minmax'):
 
     return y_pred_decoded_nms
 
-def _greedy_nms(predictions, iou_threshold=0.45, coords='minmax'):
-    '''
-    The same greedy non-maximum suppression algorithm as above, but slightly modified for use as an internal
-    function for per-class NMS in `decode_y()`.
-    '''
-    boxes_left = np.copy(predictions)
-    maxima = [] # This is where we store the boxes that make it through the non-maximum suppression
-    while boxes_left.shape[0] > 0: # While there are still boxes left to compare...
-        maximum_index = np.argmax(boxes_left[:,0]) # ...get the index of the next box with the highest confidence...
-        maximum_box = np.copy(boxes_left[maximum_index]) # ...copy that box and...
-        maxima.append(maximum_box) # ...append it to `maxima` because we'll definitely keep it
-        boxes_left = np.delete(boxes_left, maximum_index, axis=0) # Now remove the maximum box from `boxes_left`
-        if boxes_left.shape[0] == 0: break # If there are no boxes left after this step, break. Otherwise...
-        similarities = iou(boxes_left[:,1:], maximum_box[1:], coords=coords) # ...compare (IoU) the other left over boxes to the maximum box...
-        boxes_left = boxes_left[similarities <= iou_threshold] # ...so that we can remove the ones that overlap too much with the maximum box
-    return np.array(maxima)
+
+if NUMBA_INSTALLED:
+    @numba.jit(nopython=True)
+    def _greedy_nms(predictions, iou_threshold=0.45):
+        '''
+        The same greedy non-maximum suppression algorithm as above, but slightly modified for use as an internal
+        function for per-class NMS in `decode_y()`.
+        '''
+        boxes_left = np.copy(predictions)
+        # This is where we store the boxes that make it through the non-maximum suppression
+        maxima = []
+
+        # While there are still boxes left to compare...
+        while boxes_left.shape[0] > 0:
+            # ...get the index of the next box with the highest confidence...
+            maximum_index = np.argmax(boxes_left[:,0])
+            # ...copy that box and...
+            maximum_box = np.copy(boxes_left[maximum_index])
+            # ...append it to `maxima` because we'll definitely keep it
+            maxima.extend(list(maximum_box))
+            # Now remove the maximum box from `boxes_left`
+            #boxes_left = np.delete(boxes_left, maximum_index, axis=0)
+            boxes_left_new = np.empty((boxes_left.shape[0] - 1, 5), dtype=boxes_left.dtype)
+            boxes_left_new[:maximum_index, :] = boxes_left[:maximum_index, :]
+            boxes_left_new[maximum_index:, :] = boxes_left[maximum_index+1:, :]
+            boxes_left = boxes_left_new
+            # If there are no boxes left after this step, break.
+            if boxes_left.shape[0] == 0:
+                break
+            # Otherwise compare (IoU) the other left over boxes to the maximum box...
+            similarities = iou_specialized(boxes_left[:,1:], maximum_box[1:])
+            # ...so that we can remove the ones that overlap too much with the maximum box
+            boxes_left = boxes_left[similarities <= iou_threshold]
+        return np.array(maxima).reshape(-1, 5)
+else:
+    def _greedy_nms(predictions, iou_threshold=0.45, coords='minmax'):
+        '''
+        The same greedy non-maximum suppression algorithm as above, but slightly modified for use as an internal
+        function for per-class NMS in `decode_y()`.
+        '''
+        boxes_left = np.copy(predictions)
+        maxima = [] # This is where we store the boxes that make it through the non-maximum suppression
+        while boxes_left.shape[0] > 0: # While there are still boxes left to compare...
+            maximum_index = np.argmax(boxes_left[:,0]) # ...get the index of the next box with the highest confidence...
+            maximum_box = np.copy(boxes_left[maximum_index]) # ...copy that box and...
+            maxima.append(maximum_box) # ...append it to `maxima` because we'll definitely keep it
+            boxes_left = np.delete(boxes_left, maximum_index, axis=0) # Now remove the maximum box from `boxes_left`
+            if boxes_left.shape[0] == 0: break # If there are no boxes left after this step, break. Otherwise...
+            similarities = iou(boxes_left[:,1:], maximum_box[1:], coords=coords) # ...compare (IoU) the other left over boxes to the maximum box...
+            boxes_left = boxes_left[similarities <= iou_threshold] # ...so that we can remove the ones that overlap too much with the maximum box
+        return np.array(maxima)
+
 
 def _greedy_nms2(predictions, iou_threshold=0.45, coords='minmax'):
     '''
@@ -312,7 +369,7 @@ def decode_y(y_pred,
             single_class = batch_item[:,[class_id, -4, -3, -2, -1]] # ...keep only the confidences for that class, making this an array of shape `[n_boxes, 5]` and...
             threshold_met = single_class[single_class[:,0] > confidence_thresh] # ...keep only those boxes with a confidence above the set threshold.
             if threshold_met.shape[0] > 0: # If any boxes made the threshold...
-                maxima = _greedy_nms(threshold_met, iou_threshold=iou_threshold, coords='minmax') # ...perform NMS on them.
+                maxima = _greedy_nms(threshold_met, iou_threshold=iou_threshold) # ...perform NMS on them.
                 maxima_output = np.zeros((maxima.shape[0], maxima.shape[1] + 1)) # Expand the last dimension by one element to have room for the class ID. This is now an arrray of shape `[n_boxes, 6]`
                 maxima_output[:,0] = class_id # Write the class ID to the first column...
                 maxima_output[:,1:] = maxima # ...and write the maxima to the other columns...
